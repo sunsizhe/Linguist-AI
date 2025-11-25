@@ -1,0 +1,7 @@
+{
+  "name": "Linguist AI - English Master Class",
+  "description": "A professional English learning platform focusing on vocabulary application, pronunciation correction, and grammar understanding for Chinese learners.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
