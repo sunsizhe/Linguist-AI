@@ -1,3 +1,4 @@
+
 import React, { useState, useEffect, useRef } from 'react';
 import { SentenceData, EvaluationResult } from '../types';
 import { generateSentenceImage, evaluatePronunciation, generateSpeech } from '../services/geminiService';
@@ -43,7 +44,7 @@ const PracticeSession: React.FC<PracticeSessionProps> = ({ sentences, onComplete
 
   const [isRecording, setIsRecording] = useState(false);
   const [isPlaying, setIsPlaying] = useState(false); 
-  const [isAudioLoading, setIsAudioLoading] = useState(false); // New state for AI audio fetch
+  const [isAudioLoading, setIsAudioLoading] = useState(false); 
   const [isEvaluating, setIsEvaluating] = useState(false);
   
   // Current session state
@@ -62,6 +63,8 @@ const PracticeSession: React.FC<PracticeSessionProps> = ({ sentences, onComplete
   // Audio Cache & Context
   const audioContextRef = useRef<AudioContext | null>(null);
   const audioCacheRef = useRef<Record<string, AudioBuffer>>({});
+  // Track ongoing fetch promises to prevent duplicate requests (Preload vs Click)
+  const audioPromisesRef = useRef<Record<string, Promise<AudioBuffer | null>>>({});
   const activeSourceRef = useRef<AudioBufferSourceNode | null>(null);
 
   const currentSentence = sentences[currentIndex];
@@ -69,12 +72,11 @@ const PracticeSession: React.FC<PracticeSessionProps> = ({ sentences, onComplete
   
   // Web Speech API refs
   const recognitionRef = useRef<any>(null);
-  const transcriptRef = useRef<string>(''); // Current session transcript
-  const fullTranscriptRef = useRef<string>(''); // Accumulated transcript across restarts
-  const userStoppedRef = useRef<boolean>(false); // Did the user explicitly click stop?
+  const transcriptRef = useRef<string>(''); 
+  const fullTranscriptRef = useRef<string>(''); 
+  const userStoppedRef = useRef<boolean>(false); 
   
   const audioTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null); 
-  // Track current index in ref for async callbacks
   const currentIndexRef = useRef(currentIndex);
 
   // Sync Active Stage with Current Index when moving between levels
@@ -109,34 +111,81 @@ const PracticeSession: React.FC<PracticeSessionProps> = ({ sentences, onComplete
     };
   }, []);
 
-  // 1. Image Generation Effect (Load Current & Preload Next)
-  useEffect(() => {
-    if (!enableImages) return;
-
-    // A. Load Current Level Image (with loading state)
-    if (!sentenceImages[currentIndex]) {
-        setLoadingImage(true);
-        generateSentenceImage(sentences[currentIndex].english)
-            .then(imageUrl => {
-                if (imageUrl) {
-                    setSentenceImages(prev => ({...prev, [currentIndex]: imageUrl}));
-                }
-            })
-            .catch(e => console.error("Failed to generate image", e))
-            .finally(() => setLoadingImage(false));
+  // --- CORE AUDIO LOADING LOGIC (Deduped) ---
+  const loadAudioData = async (text: string): Promise<AudioBuffer | null> => {
+    // 1. Check Cache
+    if (audioCacheRef.current[text]) {
+        return audioCacheRef.current[text];
     }
 
-    // B. Preload Next Level Image (Silent background process)
-    const nextIndex = currentIndex + 1;
-    if (nextIndex < sentences.length && !sentenceImages[nextIndex]) {
-        // We use a separate async call here so we don't block anything
-        generateSentenceImage(sentences[nextIndex].english)
-            .then(imageUrl => {
-                if (imageUrl) {
-                    setSentenceImages(prev => ({...prev, [nextIndex]: imageUrl}));
-                }
-            })
-            .catch(e => console.error("Failed to preload next image", e));
+    // 2. Check In-Flight Promises
+    if (audioPromisesRef.current[text]) {
+        return audioPromisesRef.current[text];
+    }
+
+    // 3. Initiate New Fetch
+    const fetchPromise = (async () => {
+        try {
+            const base64Data = await generateSpeech(text);
+            if (!base64Data) return null;
+
+            // Ensure Context Exists
+            if (!audioContextRef.current) {
+                const AudioContext = window.AudioContext || (window as any).webkitAudioContext;
+                audioContextRef.current = new AudioContext();
+            }
+
+            const bytes = base64ToBytes(base64Data);
+            const buffer = decodePCM(bytes, audioContextRef.current);
+            
+            // Cache Result
+            audioCacheRef.current[text] = buffer;
+            return buffer;
+        } catch (e) {
+            console.error("Audio Load Error:", e);
+            return null;
+        } finally {
+            // Clean up promise ref so future retries are possible if failed
+            delete audioPromisesRef.current[text];
+        }
+    })();
+
+    audioPromisesRef.current[text] = fetchPromise;
+    return fetchPromise;
+  };
+
+
+  // 1. Preload Effects (Image & Audio)
+  useEffect(() => {
+    // --- Image Logic ---
+    if (enableImages) {
+        if (!sentenceImages[currentIndex]) {
+            setLoadingImage(true);
+            generateSentenceImage(sentences[currentIndex].english)
+                .then(imageUrl => {
+                    if (imageUrl) setSentenceImages(prev => ({...prev, [currentIndex]: imageUrl}));
+                })
+                .catch(console.error)
+                .finally(() => setLoadingImage(false));
+        }
+        const nextIndex = currentIndex + 1;
+        if (nextIndex < sentences.length && !sentenceImages[nextIndex]) {
+            generateSentenceImage(sentences[nextIndex].english)
+                .then(imageUrl => {
+                    if (imageUrl) setSentenceImages(prev => ({...prev, [nextIndex]: imageUrl}));
+                })
+                .catch(console.error);
+        }
+    }
+
+    // --- Audio Preload Logic (Auto-start) ---
+    // Load current
+    loadAudioData(sentences[currentIndex].english);
+    
+    // Preload next
+    const nextIdx = currentIndex + 1;
+    if (nextIdx < sentences.length) {
+        loadAudioData(sentences[nextIdx].english);
     }
     
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -164,7 +213,7 @@ const PracticeSession: React.FC<PracticeSessionProps> = ({ sentences, onComplete
     setIsPlaying(false);
     setIsRecording(false);
     setIsEvaluating(false);
-    setIsAudioLoading(false);
+    setIsAudioLoading(false); // Reset loading state visually
     setActiveWordIndex(null);
 
     // Check history
@@ -189,17 +238,14 @@ const PracticeSession: React.FC<PracticeSessionProps> = ({ sentences, onComplete
     setIsEvaluating(true);
     
     try {
-        // Call the correction service (not image generation)
         const result = await evaluatePronunciation(sentences[recordingIndex].english, transcript);
         
-        // Guard: If user moved to another level during analysis, DO NOT update state
         if (currentIndexRef.current !== recordingIndex) {
             console.log("Ignored stale evaluation result");
             return;
         }
 
         setEvaluation(result);
-        // Save to history
         setHistory(prev => ({...prev, [recordingIndex]: result}));
         setShowAnalysis(true);
     } catch (e) {
@@ -234,9 +280,8 @@ const PracticeSession: React.FC<PracticeSessionProps> = ({ sentences, onComplete
       };
 
       recognitionRef.current.onerror = (event: any) => {
-        // Abort/No-speech is handled by onend usually, but 'not-allowed' is critical
         if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
-             userStoppedRef.current = true; // Stop loop
+             userStoppedRef.current = true; 
              setIsRecording(false);
              alert("无法访问麦克风，请检查权限设置。");
         }
@@ -244,26 +289,18 @@ const PracticeSession: React.FC<PracticeSessionProps> = ({ sentences, onComplete
       
       recognitionRef.current.onend = () => {
           if (userStoppedRef.current) {
-              // Case 1: User explicitly stopped. Process the result.
               setIsRecording(false);
-              
               const totalText = (fullTranscriptRef.current + ' ' + transcriptRef.current).trim();
-              
               if (totalText.length > 0) {
                  handleRecordingComplete(totalText);
               }
-              // Reset buffers
               fullTranscriptRef.current = '';
               transcriptRef.current = '';
           } else {
-              // Case 2: Browser stopped automatically (silence, network). Restart it.
-              // Save what we have so far
               if (transcriptRef.current) {
                   fullTranscriptRef.current += ' ' + transcriptRef.current;
                   transcriptRef.current = '';
               }
-              
-              // Restart immediately to simulate infinite listening
               try {
                   recognitionRef.current.start();
               } catch (e) {
@@ -300,49 +337,34 @@ const PracticeSession: React.FC<PracticeSessionProps> = ({ sentences, onComplete
   };
 
   const playAudio = async (text: string = currentSentence.english, rate: number = 0.9) => {
-    if (isPlaying || isRecording || isAudioLoading) return; 
+    if (isPlaying || isRecording) return; 
 
     // Cancel any browser TTS
     window.speechSynthesis.cancel();
     if (audioTimerRef.current) clearTimeout(audioTimerRef.current);
 
+    // If preloading is still happening, this will show the loading spinner
+    // If preload finished, this is near instant.
     setIsAudioLoading(true);
 
     try {
-        // 1. Check Cache
-        let buffer = audioCacheRef.current[text];
+        // Wait for the centralized loader (Preload or New Request)
+        const buffer = await loadAudioData(text);
 
-        // 2. If not cached, fetch from Gemini
         if (!buffer) {
-            const base64Data = await generateSpeech(text);
-            
-            if (!base64Data) {
-                // Fallback to browser TTS
-                console.warn("AI Voice generation failed, using browser fallback.");
-                setIsAudioLoading(false);
-                playBrowserTTS(text, rate);
-                return;
-            }
-
-            // Decode PCM
-            if (!audioContextRef.current) {
-                const AudioContext = window.AudioContext || (window as any).webkitAudioContext;
-                audioContextRef.current = new AudioContext();
-            }
-            // Resume context (browser policy often suspends it)
-            if (audioContextRef.current.state === 'suspended') {
-                await audioContextRef.current.resume();
-            }
-            
-            const bytes = base64ToBytes(base64Data);
-            buffer = decodePCM(bytes, audioContextRef.current);
-            
-            // Cache it
-            audioCacheRef.current[text] = buffer;
+            console.warn("AI Voice load failed, fallback to browser.");
+            setIsAudioLoading(false);
+            playBrowserTTS(text, rate);
+            return;
         }
 
-        // 3. Play AudioBuffer
-        if (audioContextRef.current && buffer) {
+        // Play AudioBuffer
+        if (audioContextRef.current) {
+             // Resume context if suspended (browser policy)
+             if (audioContextRef.current.state === 'suspended') {
+                await audioContextRef.current.resume();
+             }
+
              // Stop previous source if any
              if (activeSourceRef.current) {
                  try { activeSourceRef.current.stop(); } catch(e){}
@@ -360,7 +382,7 @@ const PracticeSession: React.FC<PracticeSessionProps> = ({ sentences, onComplete
                  activeSourceRef.current = null;
              };
              
-             setIsAudioLoading(false); // Done loading, starting playback
+             setIsAudioLoading(false); // Done loading/waiting, starting playback
              setIsPlaying(true);
              source.start();
         } else {
@@ -475,7 +497,7 @@ const PracticeSession: React.FC<PracticeSessionProps> = ({ sentences, onComplete
 
   const renderSentenceWithFeedback = () => {
     // Use the detailed words array if available, otherwise fallback to simple split
-    const words = currentSentence.words || currentSentence.english.split(' ').map(t => ({ text: t, ipa: '' }));
+    const words = currentSentence.words || currentSentence.english.split(' ').map(t => ({ text: t, ipa: '', chinese: '' }));
     
     return (
       <div className={`flex flex-wrap justify-center gap-x-1 gap-y-2 z-0 transition-all duration-300 ${!showText ? 'blur-md select-none grayscale opacity-60' : 'blur-0 opacity-100'}`}>
@@ -483,16 +505,13 @@ const PracticeSession: React.FC<PracticeSessionProps> = ({ sentences, onComplete
           const wordText = wordObj.text;
           const cleanWord = wordText.replace(/[.,!?;:"'()]/g, '').toLowerCase();
           
-          // Check for errors in the current evaluation
           const error = evaluation?.errors?.find(e => e.word.toLowerCase() === cleanWord);
           const vocabItem = currentSentence.vocabAnalysis?.find(v => v.word.toLowerCase() === cleanWord);
           const isActive = activeWordIndex === idx;
           
-          // Tooltip content logic
           let TooltipContent = null;
 
           if (error) {
-            // ERROR TOOLTIP
             TooltipContent = (
                <div className="max-h-[50vh] md:max-h-[300px] overflow-y-auto custom-scrollbar rounded-2xl bg-white">
                   <div className="p-3 flex items-center justify-between border-b border-red-50/50 bg-red-50/30 sticky top-0 z-10 backdrop-blur-sm">
@@ -501,12 +520,11 @@ const PracticeSession: React.FC<PracticeSessionProps> = ({ sentences, onComplete
                               <span className="font-bold text-lg text-red-600 line-through decoration-2 decoration-red-300/50">{wordText}</span>
                               <span className="font-mono text-sm text-emerald-600 bg-emerald-50 px-1.5 rounded">/{error.expectedPhoneme || wordObj.ipa}/</span>
                           </div>
-                          {vocabItem && <span className="text-xs font-bold text-slate-500 mt-1">{vocabItem.meaning}</span>}
+                          <span className="text-xs font-bold text-slate-500 mt-1">{wordObj.chinese || (vocabItem ? vocabItem.meaning : '')}</span>
                       </div>
                       <button 
                           onClick={(e) => {
                               e.stopPropagation();
-                              // Use AI audio for words too for consistency, or fallback to browser if slow
                               playAudio(cleanWord, 0.9);
                           }}
                           disabled={isPlaying}
@@ -532,7 +550,6 @@ const PracticeSession: React.FC<PracticeSessionProps> = ({ sentences, onComplete
                </div>
             );
           } else {
-             // NORMAL TOOLTIP
              TooltipContent = (
                 <div className="max-h-[50vh] md:max-h-[300px] overflow-y-auto custom-scrollbar rounded-2xl bg-white">
                     <div className="p-3 flex items-center justify-between border-b border-emerald-50/50 bg-emerald-50/30 sticky top-0 z-10 backdrop-blur-sm">
@@ -557,18 +574,18 @@ const PracticeSession: React.FC<PracticeSessionProps> = ({ sentences, onComplete
                         </button>
                     </div>
                     
-                    {vocabItem ? (
-                        <div className="p-3 bg-white">
-                            <div className="mb-2">
-                                <div className="text-sm font-bold text-slate-700 mb-1">{vocabItem.meaning}</div>
-                                <div className="text-xs text-slate-400 italic">"{vocabItem.usage}"</div>
+                    <div className="p-3 bg-white">
+                        <div className="mb-2">
+                             {/* Always show Chinese meaning if available */}
+                            <div className="text-sm font-bold text-slate-700 mb-1">
+                                {wordObj.chinese || (vocabItem ? vocabItem.meaning : '...')}
                             </div>
+                            {/* Show detailed usage note if it's a highlighted vocabulary item */}
+                            {vocabItem && (
+                                <div className="text-xs text-slate-400 italic">"{vocabItem.usage}"</div>
+                            )}
                         </div>
-                    ) : (
-                        <div className="p-3 bg-white text-center">
-                            <span className="text-xs text-slate-400">点击小喇叭收听发音</span>
-                        </div>
-                    )}
+                    </div>
                 </div>
              );
           }
@@ -585,7 +602,6 @@ const PracticeSession: React.FC<PracticeSessionProps> = ({ sentences, onComplete
                     {wordText}
                 </span>
                 
-                {/* IPA Display under word */}
                 {wordObj.ipa && (
                     <span className={`text-[11px] font-mono mt-0.5 transition-colors ${error ? 'text-red-400' : 'text-slate-400 group-hover:text-emerald-400'}`}>
                         /{wordObj.ipa}/
@@ -620,7 +636,6 @@ const PracticeSession: React.FC<PracticeSessionProps> = ({ sentences, onComplete
     );
   };
 
-  // Get current generated image
   const currentImage = sentenceImages[currentIndex];
 
   return (
@@ -673,12 +688,10 @@ const PracticeSession: React.FC<PracticeSessionProps> = ({ sentences, onComplete
 
                 <div className="relative pl-6 ml-5 border-l-2 border-slate-100 space-y-2 pb-6">
                     {sentences.map((s, idx) => {
-                        // Only show levels for the active stage
                         const start = activeStage * LEVELS_PER_STAGE;
                         const end = start + LEVELS_PER_STAGE;
                         if (idx < start || idx >= end) return null;
 
-                        // Visual Index relative to stage (1-15)
                         const levelNum = (idx % LEVELS_PER_STAGE) + 1;
                         
                         const isActive = idx === currentIndex;
@@ -746,7 +759,6 @@ const PracticeSession: React.FC<PracticeSessionProps> = ({ sentences, onComplete
             {/* Main Practice Card */}
             <div className={`bg-white rounded-[3rem] shadow-[0_20px_60px_-10px_rgba(16,185,129,0.08)] border border-emerald-50/50 p-8 md:p-14 text-center mb-8 relative ${!enableImages ? 'pt-20' : ''}`}>
                 
-                {/* 1. SCENE IMAGE (Top of card, auto generated) - Only if enabled */}
                 {enableImages && (
                     <div className="relative z-10 mb-8 flex justify-center w-full">
                          {currentImage ? (
@@ -768,7 +780,6 @@ const PracticeSession: React.FC<PracticeSessionProps> = ({ sentences, onComplete
                     </div>
                 )}
                 
-                {/* Fallback decorative icon if no image */}
                 {!enableImages && (
                     <div className="absolute top-0 right-0 p-10 opacity-5 pointer-events-none">
                         <i className="fas fa-quote-right text-9xl text-emerald-600"></i>
@@ -780,12 +791,10 @@ const PracticeSession: React.FC<PracticeSessionProps> = ({ sentences, onComplete
                     <div className="absolute top-0 right-0 w-64 h-64 bg-emerald-50/50 rounded-full blur-3xl -mr-32 -mt-32"></div>
                 </div>
                 
-                {/* 3. SENTENCE (Interactive text with IPA under words) */}
                 <div className="relative mb-12 min-h-[100px] flex items-start justify-center z-20">
                     {renderSentenceWithFeedback()}
                 </div>
                 
-                {/* Evaluation Loading State */}
                 {isEvaluating && (
                     <div className="mb-8 font-bold text-emerald-500 animate-pulse flex items-center justify-center gap-2">
                         <i className="fas fa-spinner fa-spin"></i>
@@ -793,7 +802,6 @@ const PracticeSession: React.FC<PracticeSessionProps> = ({ sentences, onComplete
                     </div>
                 )}
                 
-                {/* Feedback Message (If any, mostly encouragement) */}
                 {evaluation && evaluation.feedback && !isEvaluating && (
                      <div className="mb-8 text-emerald-600 font-medium bg-emerald-50/50 inline-block px-4 py-2 rounded-xl text-sm border border-emerald-100 animate-fade-in">
                         <i className="fas fa-check-circle mr-2"></i>

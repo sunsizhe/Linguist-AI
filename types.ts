@@ -27,6 +27,7 @@ export interface LearningTip {
 export interface WordDetail {
   text: string;
   ipa: string;
+  chinese: string; // Added: Chinese meaning for every single word
 }
 
 export interface SentenceData {

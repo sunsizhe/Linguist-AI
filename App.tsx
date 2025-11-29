@@ -4,6 +4,7 @@ import { AppStep, SentenceData } from './types';
 import { generateArticleCurriculum, generateVocabCurriculum } from './services/geminiService';
 import InputSection from './components/InputSection';
 import PracticeSession from './components/PracticeSession';
+import ChatAssistant from './components/ChatAssistant';
 
 type ModuleType = 'article' | 'vocab' | 'scenario' | 'proficiency';
 
@@ -181,6 +182,9 @@ const App: React.FC = () => {
           </div>
         )}
       </main>
+
+      {/* Floating Chat Assistant */}
+      <ChatAssistant />
     </div>
   );
 };

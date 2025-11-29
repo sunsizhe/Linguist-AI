@@ -22,14 +22,15 @@ const sentenceGenerationSchema = {
       phonetics: { type: Type.STRING, description: "Full sentence IPA" },
       words: {
         type: Type.ARRAY,
-        description: "Break down the sentence into individual words with their specific IPA.",
+        description: "Break down the sentence into individual words with their specific IPA and simple Chinese meaning.",
         items: {
           type: Type.OBJECT,
           properties: {
             text: { type: Type.STRING },
-            ipa: { type: Type.STRING }
+            ipa: { type: Type.STRING },
+            chinese: { type: Type.STRING, description: "Concise Chinese meaning of this word in current context." }
           },
-          required: ["text", "ipa"]
+          required: ["text", "ipa", "chinese"]
         }
       },
       grammarAnalysis: {
@@ -89,6 +90,47 @@ const evaluationSchema = {
 };
 
 /**
+ * Chat Assistant API
+ * Uses stateless message history to generate a response.
+ */
+export interface ChatMessage {
+  role: 'user' | 'model';
+  text: string;
+}
+
+export const sendChatMessage = async (history: ChatMessage[], newMessage: string): Promise<string> => {
+  if (!apiKey) throw new Error("API Key is missing");
+
+  // Construct the conversation history including the new message
+  const contents = [
+    ...history.map(msg => ({
+      role: msg.role,
+      parts: [{ text: msg.text }]
+    })),
+    {
+      role: 'user',
+      parts: [{ text: newMessage }]
+    }
+  ];
+
+  try {
+    const response = await ai.models.generateContent({
+      model: MODEL_NAME, // Basic free model (Flash)
+      contents: contents,
+      config: {
+        systemInstruction: "你是一位友好的英语学习助教。你的任务是帮助用户解答关于英语学习的问题，比如单词用法、语法解释、或者陪练简单的英语对话。请用简洁、鼓励性的语气回答。如果用户用中文提问，请用中文回答；如果用户用英文提问，你可以用英文回答但适当提供中文辅助（除非用户要求全英文）。",
+        temperature: 0.7,
+      }
+    });
+
+    return response.text || "Sorry, I couldn't generate a response.";
+  } catch (error) {
+    console.error("Chat error:", error);
+    return "网络连接似乎有点问题，请稍后再试。";
+  }
+};
+
+/**
  * Mode 1: Article Study
  * Splits a long text into sequential learning segments.
  */
@@ -109,7 +151,7 @@ export const generateArticleCurriculum = async (text: string): Promise<SentenceD
        - **数量不限**：根据文本总长度自动决定 level 的数量。如果文本较长，就生成多个 level。
        - **顺序**：严格按照原文顺序输出。
     2. **分析内容（所有解释必须使用简体中文）**：
-       - **words 数组**：必须将该片段切分为独立的单词对象，并为**每个单词**提供 IPA 音标。
+       - **words 数组**：必须将该片段切分为独立的单词对象，并为**每个单词**提供 IPA 音标和**简短的中文释义**。
        - 翻译：提供地道的简体中文意译。
        - 语法分析：解析关键语法结构（必须使用中文）。
        - 重点词汇（vocabAnalysis）：选出 2-4 个重点单词进行详细解析（释义和用法说明必须使用中文）。
@@ -158,7 +200,7 @@ export const generateVocabCurriculum = async (wordsInput: string): Promise<Sente
        - 确保句子逻辑通顺，不仅仅是单词的堆砌。
     2. **难度**：B2-C1 高级水平。
     3. **分析内容（所有解释必须使用简体中文）**：
-       - **words 数组**：必须将句子切分为独立的单词对象，并为**每个单词**提供 IPA 音标。
+       - **words 数组**：必须将句子切分为独立的单词对象，并为**每个单词**提供 IPA 音标和**简短的中文释义**。
        - 翻译：提供地道的简体中文意译。
        - 语法分析：解析关键语法结构（必须使用中文）。
        - 重点词汇（vocabAnalysis）：必须包含用户提供的单词，并进行详细解析（释义和用法说明必须使用中文）。
