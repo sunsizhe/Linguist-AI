@@ -1,9 +1,7 @@
-
 import { GoogleGenAI, Type } from "@google/genai";
 import { SentenceData, EvaluationResult } from "../types";
 
-const apiKey = process.env.API_KEY || '';
-const ai = new GoogleGenAI({ apiKey });
+const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
 const MODEL_NAME = 'gemini-2.5-flash';
 const IMAGE_MODEL_NAME = 'gemini-2.5-flash-image';
@@ -76,8 +74,6 @@ const evaluationSchema = {
 };
 
 export const generateCurriculum = async (words: string[]): Promise<SentenceData[]> => {
-  if (!apiKey) throw new Error("API Key is missing");
-
   const prompt = `
     你是一位资深的语言学家、认知神经科学家和英语教师。
     请基于用户提供的以下单词列表，生成10个难度递增的英语句子用于教学。
@@ -127,8 +123,6 @@ export const generateCurriculum = async (words: string[]): Promise<SentenceData[
  * Generates a 2D Cartoon/Manga style image for the sentence.
  */
 export const generateSentenceImage = async (sentence: string): Promise<string | null> => {
-  if (!apiKey) throw new Error("API Key is missing");
-
   const prompt = `Generate a cute, vibrant, 2D cartoon or manga style illustration that depicts the following scene: "${sentence}". The style should be suitable for an educational language learning app. Flat colors, clean lines, clear composition.`;
 
   try {
@@ -159,8 +153,6 @@ export const generateSentenceImage = async (sentence: string): Promise<string | 
 };
 
 export const evaluatePronunciation = async (targetSentence: string, userTranscript: string): Promise<EvaluationResult> => {
-  if (!apiKey) throw new Error("API Key is missing");
-
   const prompt = `
     作为一名专业的英语语音纠正教练，请对比标准句子和用户录音转录文本。
     
