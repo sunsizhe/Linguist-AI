@@ -1,3 +1,4 @@
+
 export enum AppStep {
   INPUT = 'INPUT',
   GENERATING = 'GENERATING',
@@ -16,6 +17,11 @@ export interface WordAnalysis {
   meaning: string; // Chinese meaning in context
   usage: string; // Collocation or usage note
   isUserWord: boolean;
+  ipa?: string; // IPA pronunciation
+}
+
+export interface LearningTip {
+  content: string; // Vivid, easy-to-understand content
 }
 
 export interface SentenceData {
@@ -26,6 +32,7 @@ export interface SentenceData {
   grammarAnalysis: string[]; // List of grammar points
   vocabAnalysis: WordAnalysis[];
   phonetics: string; // IPA for the whole sentence
+  tip: LearningTip; // New field for the science module
 }
 
 export interface PronunciationError {
@@ -37,8 +44,10 @@ export interface PronunciationError {
 }
 
 export interface EvaluationResult {
-  score: number;
-  transcript: string;
-  errors: PronunciationError[];
-  feedback: string;
+  imageUrl?: string; // New field for the generated cartoon
+  // Fields below are kept optional for backward compatibility if we ever switch back
+  score?: number;
+  transcript?: string;
+  errors: PronunciationError[]; 
+  feedback?: string;
 }

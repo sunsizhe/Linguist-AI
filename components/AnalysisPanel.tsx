@@ -49,7 +49,10 @@ const AnalysisPanel: React.FC<AnalysisPanelProps> = ({ sentence }) => {
                 className={`p-5 rounded-2xl border transition-all duration-200 group ${word.isUserWord ? 'bg-amber-50/50 border-amber-100 hover:border-amber-200' : 'bg-white border-slate-100 hover:border-emerald-200 hover:shadow-sm'}`}
               >
                 <div className="flex items-baseline justify-between mb-2">
-                  <span className={`font-bold text-lg ${word.isUserWord ? 'text-amber-800' : 'text-slate-800'}`}>{word.word}</span>
+                  <div className="flex items-center gap-2">
+                    <span className={`font-bold text-lg ${word.isUserWord ? 'text-amber-800' : 'text-slate-800'}`}>{word.word}</span>
+                    {word.ipa && <span className="text-xs font-mono text-slate-400">/{word.ipa}/</span>}
+                  </div>
                   <span className={`text-[10px] font-black uppercase px-2 py-1 rounded-md border ${word.isUserWord ? 'bg-white text-amber-500 border-amber-200' : 'bg-slate-50 text-slate-400 border-slate-200'}`}>{word.pos}</span>
                 </div>
                 <div className={`text-sm font-bold mb-2 ${word.isUserWord ? 'text-amber-700' : 'text-slate-600'}`}>{word.meaning}</div>
@@ -69,6 +72,30 @@ const AnalysisPanel: React.FC<AnalysisPanelProps> = ({ sentence }) => {
                 {sentence.chinese}
             </p>
         </div>
+
+        {/* Brain Science & Learning Tips Module (Simplified) */}
+        {sentence.tip && (
+            <div className="relative overflow-hidden p-6 rounded-2xl border border-purple-100/50 bg-gradient-to-br from-purple-50/30 via-white to-white group hover:shadow-sm transition-all duration-300">
+                {/* Decorative Icon Background - Very subtle */}
+                <div className="absolute -right-8 -bottom-8 text-purple-50 transform rotate-12 z-0">
+                    <i className="fas fa-brain text-9xl opacity-60"></i>
+                </div>
+
+                <div className="relative z-10">
+                    <div className="flex items-center gap-3 mb-2">
+                        <div className="w-8 h-8 rounded-xl bg-purple-50/50 flex items-center justify-center text-purple-400 shadow-sm ring-1 ring-purple-100/50">
+                            <i className="fas fa-coffee"></i>
+                        </div>
+                        <h4 className="text-sm font-black text-purple-400 uppercase tracking-widest">轻松一下</h4>
+                    </div>
+                    
+                    <p className="text-slate-500 text-sm font-medium leading-relaxed text-justify pl-1">
+                        {sentence.tip.content}
+                    </p>
+                </div>
+            </div>
+        )}
+
       </div>
     </div>
   );
