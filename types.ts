@@ -24,6 +24,11 @@ export interface LearningTip {
   content: string; // Vivid, easy-to-understand content
 }
 
+export interface WordDetail {
+  text: string;
+  ipa: string;
+}
+
 export interface SentenceData {
   id: number;
   english: string;
@@ -33,6 +38,7 @@ export interface SentenceData {
   vocabAnalysis: WordAnalysis[];
   phonetics: string; // IPA for the whole sentence
   tip: LearningTip; // New field for the science module
+  words: WordDetail[]; // New field for word-by-word display
 }
 
 export interface PronunciationError {

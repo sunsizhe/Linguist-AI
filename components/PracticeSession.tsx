@@ -1,26 +1,56 @@
-
 import React, { useState, useEffect, useRef } from 'react';
 import { SentenceData, EvaluationResult } from '../types';
-import { generateSentenceImage, evaluatePronunciation } from '../services/geminiService';
+import { generateSentenceImage, evaluatePronunciation, generateSpeech } from '../services/geminiService';
 import AnalysisPanel from './AnalysisPanel';
 
 interface PracticeSessionProps {
   sentences: SentenceData[];
   onComplete: () => void;
   onBackToInput: () => void;
+  enableImages?: boolean;
 }
 
-const PracticeSession: React.FC<PracticeSessionProps> = ({ sentences, onComplete, onBackToInput }) => {
+const LEVELS_PER_STAGE = 15;
+
+// --- Audio Decoding Helpers ---
+function base64ToBytes(base64: string) {
+  const binaryString = atob(base64);
+  const length = binaryString.length;
+  const bytes = new Uint8Array(length);
+  for (let i = 0; i < length; i++) {
+    bytes[i] = binaryString.charCodeAt(i);
+  }
+  return bytes;
+}
+
+function decodePCM(data: Uint8Array, ctx: AudioContext) {
+  const sampleRate = 24000; // Gemini TTS standard rate
+  const numChannels = 1;
+  const dataInt16 = new Int16Array(data.buffer);
+  const frameCount = dataInt16.length / numChannels;
+  const buffer = ctx.createBuffer(numChannels, frameCount, sampleRate);
+  const channelData = buffer.getChannelData(0);
+  for (let i = 0; i < frameCount; i++) {
+      channelData[i] = dataInt16[i] / 32768.0;
+  }
+  return buffer;
+}
+
+const PracticeSession: React.FC<PracticeSessionProps> = ({ sentences, onComplete, onBackToInput, enableImages = true }) => {
   const [currentIndex, setCurrentIndex] = useState(0);
   const [unlockedIndex, setUnlockedIndex] = useState(0); 
+  const [activeStage, setActiveStage] = useState(0); // For sidebar display
+
   const [isRecording, setIsRecording] = useState(false);
   const [isPlaying, setIsPlaying] = useState(false); 
+  const [isAudioLoading, setIsAudioLoading] = useState(false); // New state for AI audio fetch
   const [isEvaluating, setIsEvaluating] = useState(false);
   
   // Current session state
   const [evaluation, setEvaluation] = useState<EvaluationResult | null>(null);
   const [showAnalysis, setShowAnalysis] = useState(false);
-  const [activeWordIndex, setActiveWordIndex] = useState<number | null>(null); 
+  const [activeWordIndex, setActiveWordIndex] = useState<number | null>(null);
+  const [showText, setShowText] = useState(true); // Control text visibility for listening practice
   
   // History state
   const [history, setHistory] = useState<Record<number, EvaluationResult>>({});
@@ -29,12 +59,33 @@ const PracticeSession: React.FC<PracticeSessionProps> = ({ sentences, onComplete
   const [sentenceImages, setSentenceImages] = useState<Record<number, string>>({});
   const [loadingImage, setLoadingImage] = useState(false);
 
+  // Audio Cache & Context
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const audioCacheRef = useRef<Record<string, AudioBuffer>>({});
+  const activeSourceRef = useRef<AudioBufferSourceNode | null>(null);
+
   const currentSentence = sentences[currentIndex];
+  const totalStages = Math.ceil(sentences.length / LEVELS_PER_STAGE);
   
   // Web Speech API refs
   const recognitionRef = useRef<any>(null);
-  const transcriptRef = useRef<string>(''); 
+  const transcriptRef = useRef<string>(''); // Current session transcript
+  const fullTranscriptRef = useRef<string>(''); // Accumulated transcript across restarts
+  const userStoppedRef = useRef<boolean>(false); // Did the user explicitly click stop?
+  
   const audioTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null); 
+  // Track current index in ref for async callbacks
+  const currentIndexRef = useRef(currentIndex);
+
+  // Sync Active Stage with Current Index when moving between levels
+  useEffect(() => {
+    currentIndexRef.current = currentIndex;
+    const calculatedStage = Math.floor(currentIndex / LEVELS_PER_STAGE);
+    if (calculatedStage !== activeStage) {
+        setActiveStage(calculatedStage);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentIndex]);
 
   // Handle global click to close tooltips
   useEffect(() => {
@@ -47,8 +98,21 @@ const PracticeSession: React.FC<PracticeSessionProps> = ({ sentences, onComplete
     };
   }, []);
 
+  // Initialize AudioContext
+  useEffect(() => {
+    const AudioContext = window.AudioContext || (window as any).webkitAudioContext;
+    if (AudioContext) {
+        audioContextRef.current = new AudioContext();
+    }
+    return () => {
+        audioContextRef.current?.close();
+    };
+  }, []);
+
   // 1. Image Generation Effect (Load Current & Preload Next)
   useEffect(() => {
+    if (!enableImages) return;
+
     // A. Load Current Level Image (with loading state)
     if (!sentenceImages[currentIndex]) {
         setLoadingImage(true);
@@ -76,7 +140,7 @@ const PracticeSession: React.FC<PracticeSessionProps> = ({ sentences, onComplete
     }
     
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentIndex]);
+  }, [currentIndex, enableImages]);
 
 
   // 2. Centralized State Restoration/Reset when changing levels
@@ -84,12 +148,23 @@ const PracticeSession: React.FC<PracticeSessionProps> = ({ sentences, onComplete
     // Stop any ongoing audio/recording when switching levels
     if (audioTimerRef.current) clearTimeout(audioTimerRef.current);
     window.speechSynthesis.cancel();
-    if (recognitionRef.current && isRecording) {
-        recognitionRef.current.stop();
+    if (activeSourceRef.current) {
+        try { activeSourceRef.current.stop(); } catch(e) {}
+        activeSourceRef.current = null;
     }
+    
+    // Stop recording completely
+    if (recognitionRef.current) {
+        userStoppedRef.current = true; // Prevent auto-restart in onend
+        recognitionRef.current.abort();
+    }
+    transcriptRef.current = '';
+    fullTranscriptRef.current = '';
+    
     setIsPlaying(false);
     setIsRecording(false);
     setIsEvaluating(false);
+    setIsAudioLoading(false);
     setActiveWordIndex(null);
 
     // Check history
@@ -110,20 +185,29 @@ const PracticeSession: React.FC<PracticeSessionProps> = ({ sentences, onComplete
   const handleRecordingComplete = async (transcript: string) => {
     if (!transcript.trim()) return;
     
+    const recordingIndex = currentIndexRef.current;
     setIsEvaluating(true);
     
     try {
         // Call the correction service (not image generation)
-        const result = await evaluatePronunciation(currentSentence.english, transcript);
+        const result = await evaluatePronunciation(sentences[recordingIndex].english, transcript);
         
+        // Guard: If user moved to another level during analysis, DO NOT update state
+        if (currentIndexRef.current !== recordingIndex) {
+            console.log("Ignored stale evaluation result");
+            return;
+        }
+
         setEvaluation(result);
         // Save to history
-        setHistory(prev => ({...prev, [currentIndex]: result}));
+        setHistory(prev => ({...prev, [recordingIndex]: result}));
         setShowAnalysis(true);
     } catch (e) {
         console.error("Evaluation failed", e);
     } finally {
-        setIsEvaluating(false);
+        if (currentIndexRef.current === recordingIndex) {
+            setIsEvaluating(false);
+        }
     }
   };
 
@@ -150,64 +234,144 @@ const PracticeSession: React.FC<PracticeSessionProps> = ({ sentences, onComplete
       };
 
       recognitionRef.current.onerror = (event: any) => {
-        console.error("Speech recognition error", event.error);
+        // Abort/No-speech is handled by onend usually, but 'not-allowed' is critical
         if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
+             userStoppedRef.current = true; // Stop loop
              setIsRecording(false);
              alert("无法访问麦克风，请检查权限设置。");
         }
       };
       
       recognitionRef.current.onend = () => {
-          setIsRecording(false);
-          if (transcriptRef.current && transcriptRef.current.trim().length > 0) {
-             handleRecordingComplete(transcriptRef.current);
+          if (userStoppedRef.current) {
+              // Case 1: User explicitly stopped. Process the result.
+              setIsRecording(false);
+              
+              const totalText = (fullTranscriptRef.current + ' ' + transcriptRef.current).trim();
+              
+              if (totalText.length > 0) {
+                 handleRecordingComplete(totalText);
+              }
+              // Reset buffers
+              fullTranscriptRef.current = '';
+              transcriptRef.current = '';
+          } else {
+              // Case 2: Browser stopped automatically (silence, network). Restart it.
+              // Save what we have so far
+              if (transcriptRef.current) {
+                  fullTranscriptRef.current += ' ' + transcriptRef.current;
+                  transcriptRef.current = '';
+              }
+              
+              // Restart immediately to simulate infinite listening
+              try {
+                  recognitionRef.current.start();
+              } catch (e) {
+                  console.error("Failed to restart recognition", e);
+                  setIsRecording(false); 
+              }
           }
       };
     }
     
     return () => {
         if (recognitionRef.current) {
+            userStoppedRef.current = true;
             recognitionRef.current.abort();
         }
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentIndex]); 
 
-  const playAudio = (text: string = currentSentence.english, rate: number = 0.9) => {
-    if (isPlaying || isRecording) return; 
+  const playBrowserTTS = (text: string, rate: number = 0.9) => {
+      const synth = window.speechSynthesis;
+      if (audioTimerRef.current) clearTimeout(audioTimerRef.current);
+      synth.cancel();
+      setIsPlaying(true);
+      
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.lang = 'en-US';
+      utterance.rate = rate;
+      
+      utterance.onend = () => setIsPlaying(false);
+      utterance.onerror = () => setIsPlaying(false);
+      
+      synth.speak(utterance);
+  };
 
-    const synth = window.speechSynthesis;
+  const playAudio = async (text: string = currentSentence.english, rate: number = 0.9) => {
+    if (isPlaying || isRecording || isAudioLoading) return; 
+
+    // Cancel any browser TTS
+    window.speechSynthesis.cancel();
     if (audioTimerRef.current) clearTimeout(audioTimerRef.current);
-    synth.cancel();
-    setIsPlaying(true);
 
-    const utterance = new SpeechSynthesisUtterance(text);
-    utterance.lang = 'en-US';
-    utterance.rate = rate;
-    (window as any)._currentUtterance = utterance;
-    
-    utterance.onend = () => {
-        setIsPlaying(false);
-        (window as any)._currentUtterance = null;
-    };
-    
-    utterance.onerror = (e) => {
-        if (e.error === 'interrupted' || e.error === 'canceled') return;
-        console.error("TTS Error details:", e.error);
-        setIsPlaying(false);
-        (window as any)._currentUtterance = null;
-    };
+    setIsAudioLoading(true);
 
-    audioTimerRef.current = setTimeout(() => {
-        if (synth.paused) synth.resume();
-        try {
-            synth.speak(utterance);
-        } catch (err) {
-            console.error("TTS Speak Error:", err);
-            setIsPlaying(false);
+    try {
+        // 1. Check Cache
+        let buffer = audioCacheRef.current[text];
+
+        // 2. If not cached, fetch from Gemini
+        if (!buffer) {
+            const base64Data = await generateSpeech(text);
+            
+            if (!base64Data) {
+                // Fallback to browser TTS
+                console.warn("AI Voice generation failed, using browser fallback.");
+                setIsAudioLoading(false);
+                playBrowserTTS(text, rate);
+                return;
+            }
+
+            // Decode PCM
+            if (!audioContextRef.current) {
+                const AudioContext = window.AudioContext || (window as any).webkitAudioContext;
+                audioContextRef.current = new AudioContext();
+            }
+            // Resume context (browser policy often suspends it)
+            if (audioContextRef.current.state === 'suspended') {
+                await audioContextRef.current.resume();
+            }
+            
+            const bytes = base64ToBytes(base64Data);
+            buffer = decodePCM(bytes, audioContextRef.current);
+            
+            // Cache it
+            audioCacheRef.current[text] = buffer;
         }
-        if (synth.paused) synth.resume();
-    }, 300);
+
+        // 3. Play AudioBuffer
+        if (audioContextRef.current && buffer) {
+             // Stop previous source if any
+             if (activeSourceRef.current) {
+                 try { activeSourceRef.current.stop(); } catch(e){}
+             }
+
+             const source = audioContextRef.current.createBufferSource();
+             source.buffer = buffer;
+             source.playbackRate.value = rate; // Support speed control
+             source.connect(audioContextRef.current.destination);
+             
+             activeSourceRef.current = source;
+             
+             source.onended = () => {
+                 setIsPlaying(false);
+                 activeSourceRef.current = null;
+             };
+             
+             setIsAudioLoading(false); // Done loading, starting playback
+             setIsPlaying(true);
+             source.start();
+        } else {
+            throw new Error("Audio Context not available");
+        }
+
+    } catch (e) {
+        console.error("Audio Playback Error:", e);
+        setIsAudioLoading(false);
+        playBrowserTTS(text, rate); // Fallback
+    }
   };
 
   const toggleRecording = (e: React.MouseEvent) => {
@@ -218,17 +382,26 @@ const PracticeSession: React.FC<PracticeSessionProps> = ({ sentences, onComplete
     }
 
     if (isRecording) {
+      // User wants to STOP
+      userStoppedRef.current = true;
       recognitionRef.current.stop();
     } else {
+      // User wants to START
       if (isPlaying) {
           if (audioTimerRef.current) clearTimeout(audioTimerRef.current);
           window.speechSynthesis.cancel();
+          if (activeSourceRef.current) {
+             try { activeSourceRef.current.stop(); } catch(e){}
+          }
           setIsPlaying(false);
       }
       
       setEvaluation(null);
       setActiveWordIndex(null); 
+      
       transcriptRef.current = ''; 
+      fullTranscriptRef.current = '';
+      userStoppedRef.current = false;
       
       try {
         recognitionRef.current.start();
@@ -238,6 +411,13 @@ const PracticeSession: React.FC<PracticeSessionProps> = ({ sentences, onComplete
         setIsRecording(false);
       }
     }
+  };
+
+  const toggleTextVisibility = () => {
+    if (showText) {
+        setActiveWordIndex(null); // Close tooltips when hiding text
+    }
+    setShowText(!showText);
   };
 
   const playSuccessSound = () => {
@@ -289,15 +469,19 @@ const PracticeSession: React.FC<PracticeSessionProps> = ({ sentences, onComplete
 
   const handleWordClick = (e: React.MouseEvent, idx: number) => {
       e.stopPropagation(); 
+      if (!showText) return; // Disable click when hidden
       setActiveWordIndex(activeWordIndex === idx ? null : idx);
   };
 
   const renderSentenceWithFeedback = () => {
-    const words = currentSentence.english.split(' ');
+    // Use the detailed words array if available, otherwise fallback to simple split
+    const words = currentSentence.words || currentSentence.english.split(' ').map(t => ({ text: t, ipa: '' }));
+    
     return (
-      <div className="flex flex-wrap justify-center gap-x-2 gap-y-3 text-3xl md:text-4xl font-bold font-['Nunito'] text-slate-700 leading-normal z-0">
-        {words.map((word, idx) => {
-          const cleanWord = word.replace(/[.,!?;:"'()]/g, '').toLowerCase();
+      <div className={`flex flex-wrap justify-center gap-x-1 gap-y-2 z-0 transition-all duration-300 ${!showText ? 'blur-md select-none grayscale opacity-60' : 'blur-0 opacity-100'}`}>
+        {words.map((wordObj, idx) => {
+          const wordText = wordObj.text;
+          const cleanWord = wordText.replace(/[.,!?;:"'()]/g, '').toLowerCase();
           
           // Check for errors in the current evaluation
           const error = evaluation?.errors?.find(e => e.word.toLowerCase() === cleanWord);
@@ -314,14 +498,15 @@ const PracticeSession: React.FC<PracticeSessionProps> = ({ sentences, onComplete
                   <div className="p-3 flex items-center justify-between border-b border-red-50/50 bg-red-50/30 sticky top-0 z-10 backdrop-blur-sm">
                       <div className="flex flex-col">
                           <div className="flex items-center gap-2">
-                              <span className="font-bold text-lg text-red-600 line-through decoration-2 decoration-red-300/50">{word}</span>
-                              <span className="font-mono text-sm text-emerald-600 bg-emerald-50 px-1.5 rounded">/{error.expectedPhoneme || vocabItem?.ipa}/</span>
+                              <span className="font-bold text-lg text-red-600 line-through decoration-2 decoration-red-300/50">{wordText}</span>
+                              <span className="font-mono text-sm text-emerald-600 bg-emerald-50 px-1.5 rounded">/{error.expectedPhoneme || wordObj.ipa}/</span>
                           </div>
                           {vocabItem && <span className="text-xs font-bold text-slate-500 mt-1">{vocabItem.meaning}</span>}
                       </div>
                       <button 
                           onClick={(e) => {
                               e.stopPropagation();
+                              // Use AI audio for words too for consistency, or fallback to browser if slow
                               playAudio(cleanWord, 0.9);
                           }}
                           disabled={isPlaying}
@@ -354,8 +539,8 @@ const PracticeSession: React.FC<PracticeSessionProps> = ({ sentences, onComplete
                         <div className="flex flex-col">
                             <div className="flex items-center gap-2 flex-wrap">
                                 <span className="font-bold text-lg text-emerald-800">{cleanWord}</span>
-                                {vocabItem && vocabItem.ipa && (
-                                    <span className="font-mono text-xs text-emerald-600/80">/{vocabItem.ipa}/</span>
+                                {wordObj.ipa && (
+                                    <span className="font-mono text-xs text-emerald-600/80">/{wordObj.ipa}/</span>
                                 )}
                             </div>
                             {vocabItem && <span className="text-[10px] text-emerald-500 uppercase font-black tracking-wider bg-white px-1.5 py-0.5 rounded border border-emerald-100 w-fit mt-1">{vocabItem.pos}</span>}
@@ -389,19 +574,25 @@ const PracticeSession: React.FC<PracticeSessionProps> = ({ sentences, onComplete
           }
 
           return (
-            <div key={idx} className={`relative inline-block ${isActive ? 'z-[60]' : 'z-10'}`}>
+            <div key={idx} className={`relative group flex flex-col items-center ${showText ? 'cursor-pointer' : 'cursor-default'} ${isActive ? 'z-[60]' : 'z-10'}`} onClick={(e) => handleWordClick(e, idx)}>
                 <span 
-                    onClick={(e) => handleWordClick(e, idx)}
-                    className={`transition-all cursor-pointer px-1 rounded-lg border-b-2
+                    className={`transition-all px-1.5 py-0.5 rounded-lg border-b-2 text-xl md:text-2xl font-bold font-['Nunito']
                             ${error 
                                 ? isActive ? 'text-red-600 bg-red-50 border-red-300' : 'text-red-500 border-red-200 bg-red-50/30 hover:bg-red-50'
-                                : isActive ? 'text-emerald-600 bg-emerald-50 border-emerald-200' : 'border-transparent hover:text-emerald-600 hover:bg-slate-50'
+                                : isActive ? 'text-emerald-700 bg-emerald-50 border-emerald-300' : 'text-slate-700 border-transparent hover:text-emerald-600 hover:bg-slate-50'
                             }`}
                 >
-                    {word}
+                    {wordText}
                 </span>
+                
+                {/* IPA Display under word */}
+                {wordObj.ipa && (
+                    <span className={`text-[11px] font-mono mt-0.5 transition-colors ${error ? 'text-red-400' : 'text-slate-400 group-hover:text-emerald-400'}`}>
+                        /{wordObj.ipa}/
+                    </span>
+                )}
 
-                {isActive && (
+                {isActive && showText && (
                 <>
                     <div 
                         className="fixed inset-0 bg-black/20 z-[90] md:hidden" 
@@ -433,40 +624,70 @@ const PracticeSession: React.FC<PracticeSessionProps> = ({ sentences, onComplete
   const currentImage = sentenceImages[currentIndex];
 
   return (
-    <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start font-['Nunito']">
+    <div className="grid grid-cols-1 md:grid-cols-12 gap-8 items-start font-['Nunito']">
         {/* Left Sidebar */}
-        <div className="lg:col-span-3 bg-white rounded-[2rem] shadow-sm border border-emerald-50 overflow-hidden sticky top-24">
-            <div className="bg-emerald-50/50 p-6 border-b border-emerald-50 flex items-center gap-3">
+        <div className="md:col-span-4 lg:col-span-3 bg-white rounded-[2rem] shadow-sm border border-emerald-50 overflow-hidden sticky top-24 flex flex-col max-h-[calc(100vh-8rem)]">
+            <div className="bg-emerald-50/50 p-6 border-b border-emerald-50 flex items-center gap-3 shrink-0">
                 <div className="w-10 h-10 rounded-full bg-emerald-100 flex items-center justify-center text-emerald-600 shadow-sm">
                     <i className="fas fa-map-signs"></i>
                 </div>
-                <h3 className="font-bold tracking-wide text-emerald-900 text-lg">挑战地图</h3>
+                <div>
+                    <h3 className="font-bold tracking-wide text-emerald-900 text-lg">挑战地图</h3>
+                    {totalStages > 1 && (
+                        <p className="text-[10px] text-emerald-600/70 font-bold uppercase">Stage {activeStage + 1} of {totalStages}</p>
+                    )}
+                </div>
             </div>
+
+            {/* Stage Selector (Only if > 1 stage) */}
+            {totalStages > 1 && (
+                <div className="px-4 py-3 bg-white border-b border-slate-100 flex gap-2 overflow-x-auto scrollbar-hide shrink-0">
+                    {Array.from({ length: totalStages }).map((_, idx) => (
+                        <button
+                            key={idx}
+                            onClick={() => setActiveStage(idx)}
+                            className={`px-3 py-1.5 rounded-lg text-xs font-bold whitespace-nowrap transition-all border
+                                ${activeStage === idx 
+                                    ? 'bg-emerald-500 text-white border-emerald-500 shadow-sm' 
+                                    : 'bg-slate-50 text-slate-500 border-slate-200 hover:bg-slate-100'}`}
+                        >
+                            Stage {idx + 1}
+                        </button>
+                    ))}
+                </div>
+            )}
             
-            <div className="p-4 max-h-[calc(100vh-12rem)] overflow-y-auto custom-scrollbar">
+            <div className="p-4 overflow-y-auto custom-scrollbar flex-1">
                 <button 
                     onClick={onBackToInput}
-                    className="w-full flex items-center gap-3 p-3 rounded-2xl text-slate-500 hover:bg-emerald-50 hover:text-emerald-700 transition-all mb-6 border border-dashed border-slate-200 hover:border-emerald-200 group"
+                    className="w-full flex items-center gap-3 p-3 rounded-2xl text-slate-500 hover:bg-emerald-50 hover:text-emerald-700 transition-all mb-6 border border-dashed border-slate-200 hover:border-emerald-200 group shrink-0"
                 >
                     <div className="w-10 h-10 rounded-full bg-slate-50 group-hover:bg-white flex items-center justify-center text-slate-400 group-hover:text-emerald-500 transition-colors shadow-sm">
                         <i className="fas fa-arrow-left"></i>
                     </div>
                     <div className="text-left">
                         <div className="text-xs font-bold text-slate-400 group-hover:text-emerald-400 uppercase">返回</div>
-                        <span className="font-bold text-sm">重选单词</span>
+                        <span className="font-bold text-sm">重选内容</span>
                     </div>
                 </button>
 
-                <div className="relative pl-6 ml-5 border-l-2 border-slate-100 space-y-6 pb-6">
+                <div className="relative pl-6 ml-5 border-l-2 border-slate-100 space-y-2 pb-6">
                     {sentences.map((s, idx) => {
-                        if (idx > unlockedIndex + 1) return null;
+                        // Only show levels for the active stage
+                        const start = activeStage * LEVELS_PER_STAGE;
+                        const end = start + LEVELS_PER_STAGE;
+                        if (idx < start || idx >= end) return null;
+
+                        // Visual Index relative to stage (1-15)
+                        const levelNum = (idx % LEVELS_PER_STAGE) + 1;
+                        
                         const isActive = idx === currentIndex;
                         const isCompleted = idx < unlockedIndex || history[idx]; 
                         const isLocked = idx > unlockedIndex;
 
                         return (
-                            <div key={s.id} className={`relative transition-all duration-500 ${isActive ? 'scale-100 opacity-100' : 'opacity-80 hover:opacity-100'}`}>
-                                <div className={`absolute -left-[33px] top-6 w-4 h-4 rounded-full border-4 z-10 transition-colors duration-300 box-content
+                            <div key={s.id || idx} className={`relative transition-all duration-500 ${isActive ? 'scale-100 opacity-100' : 'opacity-80 hover:opacity-100'}`}>
+                                <div className={`absolute -left-[33px] top-1/2 transform -translate-y-1/2 w-4 h-4 rounded-full border-4 z-10 transition-colors duration-300 box-content
                                     ${isActive ? 'bg-white border-emerald-400 shadow-[0_0_0_4px_rgba(52,211,153,0.2)]' : 
                                       isCompleted ? 'bg-emerald-300 border-white' : 'bg-slate-200 border-white'}`}>
                                       {isCompleted && <i className="fas fa-check text-[8px] text-white absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2"></i>}
@@ -475,7 +696,7 @@ const PracticeSession: React.FC<PracticeSessionProps> = ({ sentences, onComplete
                                 <button
                                     onClick={() => handleJumpToLevel(idx)}
                                     disabled={isLocked}
-                                    className={`w-full text-left p-4 rounded-2xl border-2 transition-all duration-300 group
+                                    className={`w-full text-left p-2.5 rounded-2xl border-2 transition-all duration-300 group
                                         ${isActive 
                                             ? 'bg-emerald-50/50 text-emerald-900 border-emerald-100 shadow-lg shadow-emerald-50' 
                                             : isCompleted 
@@ -484,13 +705,13 @@ const PracticeSession: React.FC<PracticeSessionProps> = ({ sentences, onComplete
                                         }
                                     `}
                                 >
-                                    <div className="flex justify-between items-center mb-2">
+                                    <div className="flex justify-between items-center mb-1">
                                         <span className={`text-xs font-extrabold uppercase tracking-wider ${isActive ? 'text-emerald-500' : 'text-slate-300'}`}>
-                                            LEVEL {idx + 1}
+                                            LEVEL {levelNum}
                                         </span>
                                         {isActive && <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping"></span>}
                                     </div>
-                                    <div className={`text-sm font-bold leading-snug ${isActive ? 'text-emerald-900' : ''} ${isLocked ? 'blur-[2px] select-none' : ''}`}>
+                                    <div className={`text-sm font-bold leading-snug line-clamp-2 ${isActive ? 'text-emerald-900' : ''} ${isLocked ? 'blur-[2px] select-none' : ''}`}>
                                         {s.english}
                                     </div>
                                     {isLocked && <div className="mt-2 text-xs text-slate-300 flex items-center gap-1"><i className="fas fa-lock"></i> 待解锁</div>}
@@ -503,7 +724,7 @@ const PracticeSession: React.FC<PracticeSessionProps> = ({ sentences, onComplete
         </div>
 
         {/* Main Content */}
-        <div className="lg:col-span-9">
+        <div className="md:col-span-8 lg:col-span-9">
             {/* Progress Header */}
             <div className="mb-8 flex justify-between items-center bg-white px-6 py-4 rounded-[2rem] shadow-sm border border-emerald-50">
                 <span className="text-xs font-bold uppercase tracking-wider text-slate-400 flex items-center bg-slate-50 px-3 py-1 rounded-full">
@@ -523,41 +744,43 @@ const PracticeSession: React.FC<PracticeSessionProps> = ({ sentences, onComplete
             </div>
 
             {/* Main Practice Card */}
-            <div className="bg-white rounded-[3rem] shadow-[0_20px_60px_-10px_rgba(16,185,129,0.08)] border border-emerald-50/50 p-8 md:p-14 text-center mb-8 relative">
+            <div className={`bg-white rounded-[3rem] shadow-[0_20px_60px_-10px_rgba(16,185,129,0.08)] border border-emerald-50/50 p-8 md:p-14 text-center mb-8 relative ${!enableImages ? 'pt-20' : ''}`}>
                 
-                {/* 1. SCENE IMAGE (Top of card, auto generated) */}
-                <div className="relative z-10 mb-8 flex justify-center w-full">
-                     {currentImage ? (
-                        <div className="rounded-[2rem] overflow-hidden shadow-lg border-4 border-white max-w-sm w-full animate-fade-in-up">
-                            <img src={currentImage} alt="Scene" className="w-full h-auto object-cover aspect-[4/3]" />
-                        </div>
-                     ) : (
-                        <div className="w-full max-w-sm aspect-[4/3] bg-emerald-50/30 rounded-[2rem] border-2 border-dashed border-emerald-100 flex flex-col items-center justify-center text-emerald-300 gap-2">
-                            {loadingImage ? (
-                                <>
-                                    <i className="fas fa-paint-brush animate-bounce text-2xl"></i>
-                                    <span className="text-sm font-bold animate-pulse">Drawing Scene...</span>
-                                </>
-                            ) : (
-                                <i className="fas fa-image text-3xl"></i>
-                            )}
-                        </div>
-                     )}
-                </div>
+                {/* 1. SCENE IMAGE (Top of card, auto generated) - Only if enabled */}
+                {enableImages && (
+                    <div className="relative z-10 mb-8 flex justify-center w-full">
+                         {currentImage ? (
+                            <div className="rounded-[2rem] overflow-hidden shadow-lg border-4 border-white max-w-sm w-full animate-fade-in-up">
+                                <img src={currentImage} alt="Scene" className="w-full h-auto object-cover aspect-[4/3]" />
+                            </div>
+                         ) : (
+                            <div className="w-full max-w-sm aspect-[4/3] bg-emerald-50/30 rounded-[2rem] border-2 border-dashed border-emerald-100 flex flex-col items-center justify-center text-emerald-300 gap-2">
+                                {loadingImage ? (
+                                    <>
+                                        <i className="fas fa-paint-brush animate-bounce text-2xl"></i>
+                                        <span className="text-sm font-bold animate-pulse">Drawing Scene...</span>
+                                    </>
+                                ) : (
+                                    <i className="fas fa-image text-3xl"></i>
+                                )}
+                            </div>
+                         )}
+                    </div>
+                )}
+                
+                {/* Fallback decorative icon if no image */}
+                {!enableImages && (
+                    <div className="absolute top-0 right-0 p-10 opacity-5 pointer-events-none">
+                        <i className="fas fa-quote-right text-9xl text-emerald-600"></i>
+                    </div>
+                )}
 
                 {/* Background Decor */}
                 <div className="absolute inset-0 rounded-[3rem] overflow-hidden pointer-events-none">
                     <div className="absolute top-0 right-0 w-64 h-64 bg-emerald-50/50 rounded-full blur-3xl -mr-32 -mt-32"></div>
                 </div>
                 
-                {/* 2. PHONETICS (Optional helper) */}
-                <div className="relative mb-6 z-10">
-                    <span className="text-slate-400 font-mono text-base bg-slate-50 px-6 py-2 rounded-full border border-slate-100 inline-block shadow-sm">
-                        {currentSentence.phonetics}
-                    </span>
-                </div>
-
-                {/* 3. SENTENCE (Interactive text) */}
+                {/* 3. SENTENCE (Interactive text with IPA under words) */}
                 <div className="relative mb-12 min-h-[100px] flex items-start justify-center z-20">
                     {renderSentenceWithFeedback()}
                 </div>
@@ -582,15 +805,19 @@ const PracticeSession: React.FC<PracticeSessionProps> = ({ sentences, onComplete
                 <div className="flex flex-wrap items-start justify-center gap-6 md:gap-8 relative z-10">
                     <button 
                         onClick={() => playAudio()}
-                        disabled={isPlaying || isRecording}
+                        disabled={isPlaying || isRecording || isAudioLoading}
                         className={`group w-16 h-16 rounded-2xl bg-white border border-emerald-100 flex items-center justify-center text-xl shadow-[0_10px_20px_-5px_rgba(0,0,0,0.05)] transition-all
-                            ${isPlaying || isRecording
+                            ${isPlaying || isRecording || isAudioLoading
                                 ? 'opacity-50 cursor-not-allowed bg-slate-50 text-slate-300 shadow-none'
                                 : 'text-emerald-400 hover:bg-emerald-50 hover:text-emerald-500 hover:shadow-[0_15px_30px_-5px_rgba(16,185,129,0.15)] hover:-translate-y-1'
                             }`}
                         title="播放标准音"
                     >
-                        <i className={`fas ${isPlaying ? 'fa-volume-high animate-pulse' : 'fa-volume-up transform group-hover:scale-110 transition-transform'}`}></i>
+                        {isAudioLoading ? (
+                            <i className="fas fa-circle-notch fa-spin"></i>
+                        ) : (
+                            <i className={`fas ${isPlaying ? 'fa-volume-high animate-pulse' : 'fa-volume-up transform group-hover:scale-110 transition-transform'}`}></i>
+                        )}
                     </button>
 
                     <div className="flex flex-col items-center gap-3">
@@ -613,6 +840,17 @@ const PracticeSession: React.FC<PracticeSessionProps> = ({ sentences, onComplete
                             {isRecording ? "点击完成" : "点击跟读"}
                         </span>
                     </div>
+
+                    <button 
+                        onClick={toggleTextVisibility}
+                        className={`group w-16 h-16 rounded-2xl bg-white border border-emerald-100 flex items-center justify-center text-xl shadow-[0_10px_20px_-5px_rgba(0,0,0,0.05)] transition-all
+                            ${!showText 
+                                ? 'bg-emerald-50 text-emerald-600 border-emerald-200 shadow-inner' 
+                                : 'text-slate-400 hover:bg-emerald-50 hover:text-emerald-500 hover:shadow-[0_15px_30px_-5px_rgba(16,185,129,0.15)] hover:-translate-y-1'}`}
+                        title={showText ? "隐藏文本 (盲听模式)" : "显示文本"}
+                    >
+                        <i className={`fas ${showText ? 'fa-eye' : 'fa-eye-slash'}`}></i>
+                    </button>
 
                     <button 
                         onClick={() => setShowAnalysis(!showAnalysis)}
